@@ -1,4 +1,5 @@
 
+import os
 import numpy as np
 from tqdm import tqdm
 import pandas as pd
@@ -8,6 +9,14 @@ from collections import Counter
 import argparse
 import datetime
 import time
+import zipfile
+from scipy.sparse import diags
+from scipy.sparse import dia_matrix
+from scipy.sparse import csr_matrix
+from scipy.sparse.linalg import svds
+from scipy.sparse.csgraph import connected_components
+
+sparse_types = (csc_matrix,dia_matrix,csr_matrix)
 
 starting_time = datetime.datetime.now()
 # Create the parser
@@ -34,6 +43,13 @@ filename, min_user, min_forum, verbose, outfile = args.filename, args.min_user, 
 # Define a helper function to flatten a list of lists
 def flatten(l):
     return [item for sublist in l for item in sublist]
+
+
+# Open the zip file of the file
+if filename not in os.listdir("."):
+    with zipfile.ZipFile(filename + ".zip", "r") as f:
+        # Extract the pickle file from the zip file
+        f.extract(filename,"./")
 
 # Open the file with the given filename in binary mode
 with open(filename, "rb") as f:
@@ -79,9 +95,8 @@ user_id = {x: i for i, x in enumerate(user)}
 if verbose: print("Create Adjacency Matrix")
 
 # Create a zero matrix with the number of rows equal to the number of users and the number of columns equal to the number of forums
-mat = np.zeros(shape=(len(user_id.keys()), len(forums_id.keys())))
-
 # Iterate over the keys in the dictionary
+d_temp = {}
 for tup in tqdm(list(tups.keys())):
     # Get the list of users for the current key (forum)
     users_in_forum = tups[tup]
@@ -89,13 +104,32 @@ for tup in tqdm(list(tups.keys())):
     # Get the unique id for the current forum
     forum_id = forums_id[tup]
     
+    if forum_id not in d_temp.keys():
+        d_temp[forum_id] = dict()
+    
     # Iterate over the users in the current forum
     for user_ in users_in_forum:
-        # Increment the element in the adjacency matrix at the row corresponding to the current user and the column corresponding to the current forum
-        mat[user_id[user_], forum_id] += 1
+        row = user_id[user_]
+        if row in d_temp[forum_id].keys():
+            d_temp[forum_id][row] += 1
+        else:
+            d_temp[forum_id][row] = 1
+        
+temp_lists = []
+for key in d_temp.keys():
+    temp_lists.append([(key,x[0],x[1]) for x in list(d_temp[key].items())])
+    
+cols, rows, data = zip(*flatten(temp_lists))
+        
+adj_matrix = csc_matrix((data, (rows, cols)), [len(user), len(forums)])
+assert isinstance(adj_matrix,sparse_types),"ADJ_Matrix not converted to Sparse"
 
-# Convert the adjacency matrix to a compressed sparse column (CSC) matrix
-adj_matrix = csc_matrix(mat)
+# Assure that adj_matrix is connected
+adj_matrix_square = csc_matrix((adj_matrix.data, adj_matrix.indices, np.pad(adj_matrix.indptr, (0, adj_matrix.shape[0] - adj_matrix.shape[1]), "edge")))
+num_components = connected_components(adj_matrix_square)
+print(f"The Adjacency Matrix has {num_components[0]} component")
+assert num_components[0] == 1, "Adjacency Matrix is not connected."
+del adj_matrix_square
 
 # Print a message indicating that the matrix is being normalized
 if verbose: print("Starting to Normalize Matrix")
@@ -105,6 +139,7 @@ TOTAL_SUM = adj_matrix.sum()
 
 # Divide the adjacency matrix by its total sum to create a probability matrix
 P = adj_matrix / TOTAL_SUM
+assert isinstance(P,sparse_types),"P not converted to Sparse"
 
 # Delete the adjacency matrix and the total sum to free up memory
 del adj_matrix
@@ -114,48 +149,52 @@ del TOTAL_SUM
 r = P.sum(axis=1)
 
 # Create a diagonal matrix from the flattened row mass vector
-Dr = np.diag(np.array(flatten(r.tolist())))
+Dr = diags(np.array(flatten(r.tolist())))
 
 # Calculate the column mass of the probability matrix
 c = P.sum(axis=0)
 
 # Create a diagonal matrix from the flattened column mass vector
-Dc = np.diag(np.array(flatten(c.tolist())).T)
+Dc = diags(np.array(flatten(c.tolist())).T)
 
 # Print a message indicating that the standardized matrix is being calculated
 if verbose: print("Calculating Standardized")
 
 # Calculate the standardized matrix by subtracting the product of the row and column mass matrices from the probability matrix
-standardized = (P - (r.dot(c)))
+rc = csc_matrix(r.dot(c))
+
+standardized = P - rc
+assert isinstance(standardized,sparse_types) ,"Standardized not converted to Sparse"
 
 # Print a message indicating that the S matrix is being calculated
 if verbose: print("Calculating S")
 
 # Calculate the square root of the Dr matrix
-sDr = np.sqrt(Dr)
+sDr = Dr.sqrt()
 
 # Calculate the square root of the Dc matrix
-sDc = np.sqrt(Dc)
+sDc = Dc.sqrt()
+assert isinstance(sDc,sparse_types) ,"sDc not converted to Sparse"
 
 # Calculate the S matrix by multiplying the square root of the Dr matrix by the standardized matrix and then by the square root of the Dc matrix
 S = sDr.dot(standardized).dot(sDc)
+assert isinstance(S,sparse_types) ,"S not converted to Sparse"
 
 # Print a message indicating that singular value decomposition (SVD) is starting
 if verbose: print("Starting SVD")
 
 # Use numpy's SVD function to calculate the matrices u, d, and v from the S matrix
-u, d, v = np.linalg.svd(S)
+u, d, v = svds(S, k = 1)
 
 # Print a message indicating that the projection is starting
 if verbose: print("Starting Projection")
 
 phi = sDr.dot(u)
-gamma = sDc.dot(v)
-
+gamma = sDc.dot(v.T)
 
 # Create Loadings for both
-forum_ideo = pd.DataFrame(np.concatenate([gamma[0,:],np.array(forums)[np.newaxis]], axis = 0)).transpose()
-user_ideo = pd.DataFrame(np.concatenate([phi[:,0].T,np.array(user)[np.newaxis]])).transpose()
+forum_ideo = pd.DataFrame(np.concatenate([gamma,np.array(forums)[np.newaxis].T], axis = 1))
+user_ideo = pd.DataFrame(np.concatenate([phi.T,np.array(user)[np.newaxis]])).transpose()
 forum_ideo.columns = ["ideo","forum"]
 user_ideo.columns = ["ideo","user"]
 
@@ -167,7 +206,6 @@ out = {"phi": phi,  "gamma": gamma,  "u": u ,  "d": d,
 with open(outfile, "wb") as f:
     # Dump content. 
     pickle.dump(out,f)
-  
 
 end_time = datetime.datetime.now()
 delta = end_time - starting_time
@@ -203,4 +241,3 @@ if verbose:
     for i,t in enumerate(reversed(user_ideo.sort_values("ideo").tail(20).user.values)):
         print(f"User {i}: {t}", end = "\n")
     print("#"*90)
-
